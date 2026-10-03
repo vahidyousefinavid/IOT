@@ -1,0 +1,90 @@
+# Runs on every push and pull request. Nothing merges unless the backend,
+# the app, and the whole stack running together are green.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend (Go)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - run: go vet ./...
+      - run: go test -race ./...
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  mobile:
+    name: App (Expo)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - name: Dependencies match the Expo SDK
+        run: npx expo install --check
+      - name: Bundle (catches import/resolution errors)
+        run: npx expo export --platform android --output-dir /tmp/export
+        env:
+          APP_VARIANT: production
+          EXPO_PUBLIC_API_URL: https://api.example.invalid
+
+  integration:
+    name: Full stack (smoke test)
+    runs-on: ubuntu-latest
+    needs: [backend]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build simulators
+        working-directory: backend
+        run: |
+          go build -o bin/devsim ./cmd/devsim
+          go build -o bin/trackersim ./cmd/trackersim
+      - name: Start stack
+        run: |
+          cp .env.example .env
+          sed -i 's|^GOPROXY=.*|GOPROXY=https://proxy.golang.org,direct|' .env
+          sh scripts/gen-secrets.sh >> .env
+          docker compose up -d --build --wait --wait-timeout 180 postgres redis emqx api || true
+          for i in $(seq 1 60); do curl -fs http://localhost:8080/readyz && break; sleep 2; done
+          curl -fs http://localhost:8080/readyz
+      - name: Smoke test
+        run: node scripts/smoke.mjs http://localhost:8080 tcp://localhost:1883
+      - name: Logs on failure
+        if: failure()
+        run: docker compose logs --tail 200

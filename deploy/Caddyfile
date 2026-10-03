@@ -1,0 +1,25 @@
+{
+	# Automatic HTTPS via Let's Encrypt for API_DOMAIN.
+	servers {
+		protocols h1 h2
+	}
+}
+
+{$API_DOMAIN} {
+	encode zstd gzip
+
+	# Only the public API is proxied; the broker callback port (9090) is never exposed.
+	reverse_proxy api:8080 {
+		header_up X-Forwarded-For {remote_host}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+		-Server
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}

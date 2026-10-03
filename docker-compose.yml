@@ -1,0 +1,93 @@
+# Full Hooshban stack. The same file runs in the cloud or on an on-site hub
+# (mini PC / Raspberry Pi 5) for a single home or machine.
+#
+#   cp .env.example .env && ./scripts/gen-secrets.sh >> .env
+#   docker compose up -d --build
+
+services:
+  postgres:
+    image: timescale/timescaledb:latest-pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: hooshban
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      POSTGRES_DB: hooshban
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hooshban"]
+      interval: 5s
+      retries: 10
+    networks: [internal]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?set in .env}", "--appendonly", "yes"]
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep PONG"]
+      interval: 5s
+      retries: 10
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    networks: [internal]
+
+  emqx:
+    image: emqx/emqx:5.8
+    restart: unless-stopped
+    environment:
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN:?set in .env}
+      EMQX_DASHBOARD__DEFAULT_PASSWORD: ${EMQX_DASHBOARD_PASSWORD:?set in .env}
+      EMQX_NODE__COOKIE: ${EMQX_COOKIE:?set in .env}
+    # Render the config template with the shared secret, then start EMQX normally.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - sed "s|__INTERNAL_TOKEN__|$$INTERNAL_TOKEN|g" /tpl/base.hocon.tpl > /opt/emqx/etc/base.hocon && exec /usr/bin/docker-entrypoint.sh /opt/emqx/bin/emqx foreground
+    volumes:
+      - ./deploy/emqx/base.hocon.tpl:/tpl/base.hocon.tpl:ro
+      - emqxdata:/opt/emqx/data
+    ports:
+      - "1883:1883"                  # development only; use 8883 (TLS) in production
+      - "8883:8883"
+      - "127.0.0.1:18083:18083"      # dashboard: localhost only
+    networks: [internal]
+
+  api:
+    build:
+      context: ./backend
+      args:
+        GOPROXY: ${GOPROXY:-https://proxy.golang.org,direct}
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      DATABASE_URL: postgres://hooshban:${POSTGRES_PASSWORD}@postgres:5432/hooshban?sslmode=disable
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      MQTT_URL: tcp://emqx:1883
+      MQTT_CORE_PASSWORD: ${MQTT_CORE_PASSWORD}
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN}
+      JWT_ED25519_SEED: ${JWT_ED25519_SEED}
+      DEVICE_PEPPER: ${DEVICE_PEPPER}
+      TRUST_PROXY: ${TRUST_PROXY:-false}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+      TRACKER_GT06_ADDR: ":5023"
+      TRACKER_H02_ADDR: ":5013"
+    ports:
+      - "8080:8080"                  # put a TLS reverse proxy (Caddy/Nginx) in front in production
+      - "5023:5023"                  # GPS trackers, GT06 protocol (TCP)
+      - "5013:5013"                  # GPS trackers, H02 protocol (TCP)
+    # 9090 (broker callbacks) is deliberately not published.
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    networks: [internal]
+
+networks:
+  internal:
+
+volumes:
+  pgdata:
+  redisdata:
+  emqxdata:

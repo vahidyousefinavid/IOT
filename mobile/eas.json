@@ -1,0 +1,36 @@
+{
+  "cli": {
+    "version": ">= 16.0.0",
+    "appVersionSource": "remote"
+  },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal"
+    },
+    "preview": {
+      "distribution": "internal",
+      "android": {
+        "buildType": "apk"
+      },
+      "env": {
+        "EXPO_PUBLIC_API_URL": "https://api.example.com",
+        "EXPO_PUBLIC_MQTT_HOST": "mqtt.example.com",
+        "EXPO_PUBLIC_TRACKER_HOST": "trk.example.com",
+        "EXPO_PUBLIC_MAP_TILES": "https://tiles.example.com/{z}/{x}/{y}.png"
+      }
+    },
+    "production": {
+      "autoIncrement": true,
+      "env": {
+        "EXPO_PUBLIC_API_URL": "https://api.example.com",
+        "EXPO_PUBLIC_MQTT_HOST": "mqtt.example.com",
+        "EXPO_PUBLIC_TRACKER_HOST": "trk.example.com",
+        "EXPO_PUBLIC_MAP_TILES": "https://tiles.example.com/{z}/{x}/{y}.png"
+      }
+    }
+  },
+  "submit": {
+    "production": {}
+  }
+}

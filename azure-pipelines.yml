@@ -1,0 +1,114 @@
+# Azure DevOps pipeline (same model as the Samantel projects: push to main
+# → deployed by an agent on the server). Adapted to Iran's network limits:
+#
+#   Build   Microsoft-hosted agent (outside Iran: Google, Docker Hub reachable)
+#           → tests, API image, signed Android APK, as pipeline artifacts
+#   Deploy  self-hosted agent ON the server (pool $(AGENT_POOL))
+#           → downloads the image artifact, deploy/small/deploy.sh
+#             (DB backup, health check, automatic rollback)
+#
+# One-time setup: docs/AZURE.md
+trigger:
+  branches:
+    include: [main]
+
+pr:
+  branches:
+    include: [main]
+
+variables:
+  - group: hooshban            # API_URL, GT06_PORT, H02_PORT, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_PASSWORD
+  - name: AGENT_POOL
+    value: hooshban-server
+
+stages:
+  - stage: Build
+    jobs:
+      - job: backend
+        displayName: Backend tests + API image
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+          - script: |
+              set -euo pipefail
+              echo "##vso[task.setvariable variable=VERSION]$(cat VERSION)"
+            displayName: Read VERSION
+          - script: |
+              docker run --rm -v "$(Build.SourcesDirectory)/backend:/src" -w /src golang:1.26-alpine \
+                sh -c 'test -z "$(gofmt -l .)" && go vet ./... && go test ./...'
+            displayName: gofmt, vet, test
+          - script: |
+              set -euo pipefail
+              docker build \
+                --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(Build.SourceVersion) \
+                -t hooshban-api:$(VERSION) backend
+              docker save hooshban-api:$(VERSION) | gzip > "$(Build.ArtifactStagingDirectory)/api-image.tar.gz"
+              echo "hooshban-api:$(VERSION)" > "$(Build.ArtifactStagingDirectory)/image.txt"
+              cp VERSION "$(Build.ArtifactStagingDirectory)/"
+            displayName: Build API image
+          - publish: $(Build.ArtifactStagingDirectory)
+            artifact: api-image
+
+      - job: android
+        displayName: Android APK
+        pool:
+          vmImage: ubuntu-latest
+        timeoutInMinutes: 60
+        steps:
+          - checkout: self
+          - task: NodeTool@0
+            inputs:
+              versionSpec: '22.x'
+          - task: DownloadSecureFile@1
+            name: keystore
+            inputs:
+              secureFile: upload.jks
+          - script: |
+              set -euo pipefail
+              cd mobile
+              npm ci --no-audit --no-fund
+              npx tsc --noEmit
+              npx expo prebuild --platform android --no-install --clean
+              cd android
+              ./gradlew --no-daemon assembleRelease
+              v="$(cat ../../VERSION)"
+              cp app/build/outputs/apk/release/app-release.apk "$(Build.ArtifactStagingDirectory)/hooshban-$v-$(Build.BuildId)-preview.apk"
+            displayName: Build signed APK
+            env:
+              JAVA_HOME: $(JAVA_HOME_17_X64)
+              APP_VARIANT: preview
+              EXPO_PUBLIC_API_URL: $(API_URL)
+              EXPO_PUBLIC_GT06_PORT: $(GT06_PORT)
+              EXPO_PUBLIC_H02_PORT: $(H02_PORT)
+              HOOSHBAN_KEYSTORE: $(keystore.secureFilePath)
+              HOOSHBAN_KEYSTORE_PASSWORD: $(ANDROID_KEYSTORE_PASSWORD)
+              HOOSHBAN_KEY_ALIAS: hooshban-upload
+              HOOSHBAN_KEY_PASSWORD: $(ANDROID_KEY_PASSWORD)
+          - publish: $(Build.ArtifactStagingDirectory)
+            artifact: android
+
+  - stage: Deploy
+    dependsOn: Build
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: server
+        displayName: Deploy API to server
+        pool:
+          name: $(AGENT_POOL)
+        environment: production      # add an approval check here if wanted
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - download: current
+                  artifact: api-image
+                - script: |
+                    set -euo pipefail
+                    art="$(Pipeline.Workspace)/api-image"
+                    image="$(cat "$art/image.txt")"
+                    version="$(cat "$art/VERSION")"
+                    gunzip -c "$art/api-image.tar.gz" | (docker load 2>/dev/null || sudo -n docker load)
+                    bash deploy/small/deploy.sh "$image" "$version"
+                  displayName: Deploy (backup, health check, rollback)

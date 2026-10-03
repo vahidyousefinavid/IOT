@@ -1,0 +1,12 @@
+
+# Production: devices connect with MQTT over TLS using a real certificate.
+listeners.ssl.default {
+  bind = "0.0.0.0:8883"
+  ssl_options {
+    certfile = "/opt/emqx/etc/certs/public/fullchain.pem"
+    keyfile = "/opt/emqx/etc/certs/public/privkey.pem"
+    versions = ["tlsv1.3", "tlsv1.2"]
+  }
+}
+listeners.ws.default.enable = false
+listeners.wss.default.enable = false

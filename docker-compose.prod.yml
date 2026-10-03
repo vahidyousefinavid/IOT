@@ -1,0 +1,48 @@
+# Production overlay: TLS everywhere, nothing but 443 (API) and 8883 (MQTT/TLS) exposed.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#
+# Needs in .env: API_DOMAIN (DNS pointing here), and MQTT TLS certificates for
+# MQTT_DOMAIN at deploy/certs/fullchain.pem and deploy/certs/privkey.pem
+# (e.g. certbot certonly --standalone -d mqtt.example.com).
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on: [api]
+    environment:
+      API_DOMAIN: ${API_DOMAIN:?set API_DOMAIN in .env}
+    ports:
+      - "80:80"     # ACME HTTP challenge + redirect to HTTPS
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddydata:/data
+    networks: [internal]
+
+  api:
+    # Released image, loaded onto the server by the Deploy workflow.
+    image: ${API_IMAGE:-hooshban-api:local}
+    pull_policy: never
+    ports: !override          # HTTP only through Caddy; trackers connect directly
+      - "5023:5023"
+      - "5013:5013"
+    environment:
+      APP_ENV: production
+      TRUST_PROXY: "true"      # Caddy overwrites X-Forwarded-For
+      CORS_ORIGINS: ""
+
+  emqx:
+    ports: !override
+      - "8883:8883"            # MQTT over TLS only; plain 1883 stays inside the network
+    volumes:
+      - ./deploy/emqx/base.hocon.tpl:/tpl/base.hocon.tpl:ro
+      - ./deploy/emqx/tls.hocon:/tpl/tls.hocon:ro
+      - ./deploy/certs:/opt/emqx/etc/certs/public:ro
+      - emqxdata:/opt/emqx/data
+    command:
+      - sed "s|__INTERNAL_TOKEN__|$$INTERNAL_TOKEN|g" /tpl/base.hocon.tpl > /opt/emqx/etc/base.hocon && cat /tpl/tls.hocon >> /opt/emqx/etc/base.hocon && exec /usr/bin/docker-entrypoint.sh /opt/emqx/bin/emqx foreground
+
+volumes:
+  caddydata:

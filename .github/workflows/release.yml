@@ -1,0 +1,157 @@
+# Pushing a tag vX.Y.Z (made by `node scripts/release.mjs X.Y.Z`) builds every
+# deliverable of that exact version and publishes a GitHub Release:
+#   - API image      ghcr.io/<owner>/<repo>/api:X.Y.Z (amd64 + arm64 for on-site hubs)
+#   - Android        signed APK (direct install) and AAB (Play / Myket / Bazaar)
+#   - iOS            via EAS Build, only if EXPO_TOKEN is configured
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        name: Tag must match VERSION
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          file="$(cat VERSION)"
+          if [ "$tag" != "$file" ]; then echo "::error::tag v$tag but VERSION is $file"; exit 1; fi
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
+
+  api-image:
+    needs: meta
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}/api" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: backend
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            VERSION=${{ needs.meta.outputs.version }}
+            COMMIT=${{ github.sha }}
+          tags: |
+            ${{ steps.image.outputs.name }}:${{ needs.meta.outputs.version }}
+            ${{ steps.image.outputs.name }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  android:
+    needs: meta
+    runs-on: ubuntu-latest
+    env:
+      APP_VARIANT: production
+      EXPO_PUBLIC_API_URL: ${{ vars.API_URL }}
+      EXPO_PUBLIC_MQTT_HOST: ${{ vars.MQTT_HOST }}
+      EXPO_PUBLIC_TRACKER_HOST: ${{ vars.TRACKER_HOST }}
+      EXPO_PUBLIC_MAP_TILES: ${{ vars.MAP_TILES }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Required configuration
+        run: |
+          missing=""
+          [ -n "$EXPO_PUBLIC_API_URL" ] || missing="$missing vars.API_URL"
+          [ -n "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ] || missing="$missing secrets.ANDROID_KEYSTORE_BASE64"
+          if [ -n "$missing" ]; then echo "::error::missing:$missing (see docs/RELEASING.md)"; exit 1; fi
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Install
+        working-directory: mobile
+        run: npm ci
+      - name: Generate native project
+        working-directory: mobile
+        run: npx expo prebuild --platform android --no-install --clean
+      - name: Decode signing key
+        run: |
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > "$RUNNER_TEMP/upload.jks"
+          echo "HOOSHBAN_KEYSTORE=$RUNNER_TEMP/upload.jks" >> "$GITHUB_ENV"
+      - name: Build APK and AAB
+        working-directory: mobile/android
+        env:
+          HOOSHBAN_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          HOOSHBAN_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          HOOSHBAN_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: ./gradlew --no-daemon assembleRelease bundleRelease
+      - name: Collect
+        run: |
+          v=${{ needs.meta.outputs.version }}
+          mkdir dist
+          cp mobile/android/app/build/outputs/apk/release/app-release.apk "dist/hooshban-$v.apk"
+          cp mobile/android/app/build/outputs/bundle/release/app-release.aab "dist/hooshban-$v.aab"
+          (cd dist && sha256sum * > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: dist/
+
+  ios:
+    needs: meta
+    runs-on: ubuntu-latest
+    if: ${{ vars.IOS_ENABLED == 'true' }}
+    env:
+      APP_VARIANT: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: expo/expo-github-action@v8
+        with:
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+      - working-directory: mobile
+        run: |
+          npm ci
+          eas build --platform ios --profile production --non-interactive --no-wait
+
+  publish:
+    needs: [meta, api-image, android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: android
+          path: dist
+      - name: Release notes from CHANGELOG
+        run: |
+          v=${{ needs.meta.outputs.version }}
+          awk -v v="## $v" '$0 ~ "^## " { p = ($0 ~ "^"v) } p' CHANGELOG.md > notes.md
+          echo "" >> notes.md
+          echo "API image: \`ghcr.io/${GITHUB_REPOSITORY,,}/api:$v\`" >> notes.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: v${{ needs.meta.outputs.version }}
+          body_path: notes.md
+          files: dist/*

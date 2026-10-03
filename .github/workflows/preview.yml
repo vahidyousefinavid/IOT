@@ -1,0 +1,72 @@
+# Installable test build for phones, from any branch.
+#
+# Actions → "Preview APK" → Run workflow, enter the server address the phone
+# should use (e.g. http://192.168.1.10:8080 for a server on your Wi-Fi), then
+# download the APK from the run's Artifacts. Also runs on every push to main
+# when the PREVIEW_API_URL variable is set.
+#
+# The preview app installs next to the production app (different package id)
+# and may use plain HTTP, so it can talk to a development server on the LAN.
+name: Preview APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      api_url:
+        description: Server URL the app connects to
+        required: true
+        default: http://192.168.1.10:8080
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    if: ${{ github.event_name == 'workflow_dispatch' || vars.PREVIEW_API_URL != '' }}
+    runs-on: ubuntu-latest
+    env:
+      APP_VARIANT: preview
+      EXPO_PUBLIC_API_URL: ${{ inputs.api_url || vars.PREVIEW_API_URL }}
+      EXPO_PUBLIC_MAP_TILES: ${{ vars.MAP_TILES }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+      - working-directory: mobile
+        run: |
+          npm ci
+          npx expo prebuild --platform android --no-install --clean
+      - name: Signing key (optional; debug key otherwise)
+        if: ${{ env.KEY != '' }}
+        env:
+          KEY: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          echo "$KEY" | base64 -d > "$RUNNER_TEMP/upload.jks"
+          echo "HOOSHBAN_KEYSTORE=$RUNNER_TEMP/upload.jks" >> "$GITHUB_ENV"
+      - name: Build APK
+        working-directory: mobile/android
+        env:
+          HOOSHBAN_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          HOOSHBAN_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          HOOSHBAN_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: ./gradlew --no-daemon assembleRelease
+      - name: Name the artifact
+        run: |
+          v="$(cat VERSION)-preview.${{ github.run_number }}"
+          mkdir dist && cp mobile/android/app/build/outputs/apk/release/app-release.apk "dist/hooshban-$v.apk"
+          echo "APK_NAME=hooshban-$v" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APK_NAME }}
+          path: dist/*.apk
+          retention-days: 30

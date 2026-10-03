@@ -1,0 +1,78 @@
+# Deploys a released API version to the production server.
+#
+# Runs automatically after a Release succeeds, or manually (Actions → Deploy →
+# Run workflow) with any earlier version to roll back. The "production"
+# environment can require a reviewer's approval in the repository settings.
+#
+# The image is copied over SSH (docker save | docker load), so the server never
+# needs to reach a container registry — useful when registries are filtered.
+name: Deploy
+
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to deploy (e.g. 0.2.0); empty = VERSION on main
+        required: false
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  deploy:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - id: v
+        run: |
+          v="${{ inputs.version }}"
+          [ -n "$v" ] || v="$(cat VERSION)"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}/api:$v" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: SSH setup
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          echo "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          cat >> ~/.ssh/config <<EOF
+          Host prod
+            HostName ${{ secrets.DEPLOY_HOST }}
+            User ${{ secrets.DEPLOY_USER }}
+            Port ${{ secrets.DEPLOY_PORT || 22 }}
+            IdentityFile ~/.ssh/id_deploy
+            StrictHostKeyChecking yes
+          EOF
+
+      - name: Ship image
+        run: |
+          docker pull --platform linux/amd64 "${{ steps.v.outputs.image }}"
+          docker save "${{ steps.v.outputs.image }}" | gzip | ssh prod 'gunzip | docker load'
+
+      - name: Ship configuration
+        run: |
+          ssh prod 'mkdir -p /opt/hooshban/deploy'
+          scp docker-compose.yml docker-compose.prod.yml prod:/opt/hooshban/
+          scp -r deploy/emqx deploy/Caddyfile deploy/remote-deploy.sh prod:/opt/hooshban/deploy/
+
+      - name: Deploy (backup, migrate, health check, auto-rollback)
+        run: ssh prod "sh /opt/hooshban/deploy/remote-deploy.sh '${{ steps.v.outputs.image }}' '${{ steps.v.outputs.version }}'"
